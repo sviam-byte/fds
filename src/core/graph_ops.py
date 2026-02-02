@@ -193,6 +193,8 @@ def calculate_metrics(
     curvature_sample_edges: int = 150,
     curvature_max_support: int = settings.RICCI_MAX_SUPPORT,
     curvature_cutoff: float = settings.RICCI_CUTOFF,
+    # Skip spectral/modularity for fast intermediate steps on large graphs.
+    skip_spectral: bool = False,
     **kwargs,
 ) -> GraphMetrics:
     N = G.number_of_nodes()
@@ -217,14 +219,27 @@ def calculate_metrics(
     lcc_size = len(max(nx.connected_components(H_u), key=len)) if N > 0 else 0
     lcc_frac = lcc_size / N if N > 0 else 0.0
 
-    lmax = spectral_radius_weighted_adjacency(G)
-    thresh = (1.0 / lmax) if lmax > 0 else 0.0
+    if not skip_spectral:
+        lmax = spectral_radius_weighted_adjacency(G)
+        thresh = (1.0 / lmax) if lmax > 0 else 0.0
 
-    l2 = lambda2_on_lcc(G)
-    tau = (1.0 / l2) if l2 > 0 else float("inf")
+        l2 = lambda2_on_lcc(G)
+        tau = (1.0 / l2) if l2 > 0 else float("inf")
 
-    eff_w = approx_weighted_efficiency(G, sources_k=eff_sources_k, seed=seed)
-    Q = compute_modularity_louvain(G, seed=seed)
+        Q = compute_modularity_louvain(G, seed=seed)
+    else:
+        # Заглушки на быстрых шагах: тяжелая спектральная/модульность пропускается.
+        lmax = 0.0
+        thresh = 0.0
+        l2 = 0.0
+        tau = float("inf")
+        Q = float("nan")
+
+    if skip_spectral:
+        # Быстрый режим: ограничиваем выборку для эффективности.
+        eff_w = approx_weighted_efficiency(G, sources_k=min(eff_sources_k, 8), seed=seed)
+    else:
+        eff_w = approx_weighted_efficiency(G, sources_k=eff_sources_k, seed=seed)
 
     ent = degree_entropy(G)
     assort = nx.degree_assortativity_coefficient(G) if N > 2 and E > 0 else 0.0
@@ -330,16 +345,8 @@ def calculate_metrics(
 
 
 def compute_3d_layout(G: nx.Graph, seed: int) -> dict:
-    """Fast-ish deterministic 3D layout.
-
-    `networkx.spring_layout(dim=3)` is O(N^2 * iters) and becomes unusable on
-    graphs of a few thousand nodes inside Streamlit.
-
-    Strategy:
-    - Small graphs: true 3D spring.
-    - Large graphs: 2D spring with low iterations + synthetic Z from degree.
-      This keeps relative structure readable while being orders of magnitude
-      faster and deterministic for a given seed.
+    """
+    Optimized deterministic 3D layout.
     """
     N = G.number_of_nodes()
     if N == 0:
@@ -347,32 +354,43 @@ def compute_3d_layout(G: nx.Graph, seed: int) -> dict:
 
     seed = int(seed)
 
-    # Hard threshold: above this, full 3D spring is too slow for interactive UI.
-    FAST_N = 1800
+    # Снижаем порог. 1800 было слишком много для чистого Python.
+    # 500 узлов — комфортный предел для честного 3D force-directed.
+    FAST_N = 500
 
     if N <= FAST_N:
-        # Still limit iterations a bit to keep UX snappy.
-        return nx.spring_layout(G, dim=3, weight="weight", seed=seed, iterations=60)
+        # Для малых графов: честный 3D, но меньше итераций (40 достаточно для формы)
+        return nx.spring_layout(G, dim=3, weight="weight", seed=seed, iterations=40, threshold=1e-4)
 
-    # Fast path: compute a cheap 2D layout, then lift into 3D with a stable Z.
-    pos2 = nx.spring_layout(G, dim=2, weight="weight", seed=seed, iterations=25)
+    # Fast path: считаем 2D (это намного быстрее сходится),
+    # а Z-координату синтезируем из centrality.
+    # Уменьшаем итерации до 15 — этого хватит, чтобы "расправить" ком.
+    pos2 = nx.spring_layout(G, dim=2, weight="weight", seed=seed, iterations=15, threshold=1e-3)
 
-    # Stable Z: normalized degree + tiny deterministic jitter to break ties.
+    # Z-axis heuristic:
+    # Центральные узлы (хабы) поднимаем выше, периферию опускаем.
+    # Добавляем "шум", чтобы узлы с одинаковой степенью не слипались в плоскости.
     rng = np.random.default_rng(seed)
-    deg = np.array([G.degree(n) for n in pos2.keys()], dtype=float)
-    if deg.size:
-        dmin = float(np.min(deg))
-        dmax = float(np.max(deg))
+
+    # Используем degree centrality как базу для Z
+    d_dict = dict(G.degree())
+    d_vals = np.array([d_dict[n] for n in pos2.keys()], dtype=float)
+
+    if d_vals.size:
+        dmin, dmax = d_vals.min(), d_vals.max()
         denom = (dmax - dmin) if (dmax - dmin) > 1e-9 else 1.0
-        dz = (deg - dmin) / denom
+        # Нормализуем 0..1 и растягиваем на -1..1
+        dz = 2.0 * ((d_vals - dmin) / denom) - 1.0
     else:
         dz = np.zeros(len(pos2), dtype=float)
-    dz = dz + (rng.normal(0.0, 0.015, size=dz.shape) if dz.size else dz)
 
-    # Assemble 3D dict. Use float32 to cut Plotly JSON size.
+    # Добавляем jitter, чтобы разбить слои
+    dz += rng.normal(0.0, 0.15, size=dz.shape)
+
     out = {}
     nodes = list(pos2.keys())
     for i, n in enumerate(nodes):
         x, y = pos2[n]
-        out[n] = (np.float32(x), np.float32(y), np.float32(dz[i]))
+        # Приводим к float для JSON-сериализации Plotly
+        out[n] = (float(x), float(y), float(dz[i]))
     return out

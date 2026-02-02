@@ -110,8 +110,9 @@ def pick_targets_for_attack(
     if attack_kind == "betweenness":
         H = add_dist_attr(G)
         n = H.number_of_nodes()
-        # Aggressive sampling: k ~= sqrt(n) capped for speed on large graphs.
-        k_samples = min(int(math.sqrt(n)) + 1, 100, n)
+        # ОПТИМИЗАЦИЯ: k_samples было слишком большим.
+        # Ставим жесткий лимит 40 - этого достаточно для атаки, но работает мгновенно.
+        k_samples = min(int(math.sqrt(n)) + 1, 40, n)
         bc = nx.betweenness_centrality(H, k=k_samples, weight="dist", normalized=True, seed=int(seed))
         return sorted(nodes, key=lambda n: bc.get(n, 0.0), reverse=True)[:step_size]
 
@@ -195,11 +196,22 @@ def run_attack(
 
         # Metrics snapshot.
         heavy = (i % max(1, int(compute_heavy_every)) == 0)
-        met = (
-            calculate_metrics(G, int(eff_sources_k), int(seed), False)
-            if heavy
-            else {"N": G.number_of_nodes(), "E": G.number_of_edges()}
-        )
+
+        # Если граф большой (>500 узлов), даже на "heavy" шагах не считаем совсем
+        # тяжелую математику, если это не первый и не последний шаг.
+        is_really_heavy_step = (i == 0) or (i == len(ks) - 1)
+        skip_spectral = (G.number_of_nodes() > 500) and not is_really_heavy_step
+
+        if heavy:
+            met = calculate_metrics(
+                G,
+                int(eff_sources_k),
+                int(seed),
+                False,
+                skip_spectral=skip_spectral,
+            )
+        else:
+            met = {"N": G.number_of_nodes(), "E": G.number_of_edges()}
         met.update(
             {
                 "step": i,
@@ -388,12 +400,17 @@ def run_edge_attack(
 
         removed_frac = (k / total_e) if total_e else 0.0
         heavy = (i % int(max(1, compute_heavy_every)) == 0) or (i == steps)
+
+        is_really_heavy_step = (i == 0) or (i == len(ks) - 1)
+        skip_spectral = (H.number_of_nodes() > 500) and not is_really_heavy_step
+
         metrics = calculate_metrics(
             H,
             eff_sources_k=int(eff_k),
             seed=int(seed),
             compute_curvature=bool(compute_curvature and heavy),
             curvature_sample_edges=int(curvature_sample_edges),
+            skip_spectral=skip_spectral,
         )
 
         row = {

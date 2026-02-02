@@ -16,6 +16,7 @@ from src.null_models import make_er_gnm, make_configuration_model, rewire_mix
 from src.attacks import run_attack, run_edge_attack
 from src.attacks_mix import run_mix_attack
 from src.core_math import classify_phase_transition
+from src.config_loader import load_metrics_info
 from src.plotting import fig_metrics_over_steps, fig_compare_attacks
 from src.services.graph_service import GraphService
 from src.state_models import GraphEntry
@@ -30,6 +31,10 @@ from src.ui_blocks import help_icon
 from src.utils import as_simple_undirected, get_node_strength
 
 _layout_cached = GraphService.compute_layout3d
+
+# Загружаем справку по метрикам один раз на модуль.
+_info = load_metrics_info()
+METRIC_HELP = _info.get("metric_help", {})
 
 # presets moved out of app.py
 ATTACK_PRESETS_NODE = {

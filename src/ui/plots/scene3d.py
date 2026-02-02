@@ -67,10 +67,13 @@ def make_energy_flow_figure_3d(
 
     steps = min(int(steps), len(node_frames) - 1)
 
+    # ВАЖНО: Определяем глобальный максимум энергии для корректной нормировки цвета
     Emax = 0.0
     for fr in node_frames[: steps + 1]:
         if fr:
-            Emax = max(Emax, max(fr.values()))
+            vals = [v for v in fr.values() if np.isfinite(v)]
+            if vals:
+                Emax = max(Emax, max(vals))
     if Emax <= 0:
         Emax = 1.0
 
@@ -98,12 +101,9 @@ def make_energy_flow_figure_3d(
     # Plotly иногда спотыкается об numpy-типы при JSON-сериализации
     # (особенно внутри frames). Поэтому приводим всё к простым python
     # спискам заранее.
-    coords = np.array([pos3d.get(n, (0.0, 0.0, 0.0)) for n in nodes], dtype=np.float32)
-    # Cut JSON size. 3-4 decimals are plenty for UI.
-    coords = np.round(coords, 4)
-    xs = coords[:, 0].astype(float).tolist()
-    ys = coords[:, 1].astype(float).tolist()
-    zs = coords[:, 2].astype(float).tolist()
+    # Pre-process coordinates
+    coords = np.array([pos3d.get(n, (0.0, 0.0, 0.0)) for n in nodes], dtype=float)
+    xs, ys, zs = coords[:, 0], coords[:, 1], coords[:, 2]
 
     # UI opts (passed through from tabs/energy.py).
     node_size = float(_ignored.get("node_size", 6) or 6)
@@ -112,72 +112,76 @@ def make_energy_flow_figure_3d(
     edge_subset_mode = str(_ignored.get("edge_subset_mode", "all") or "all").lower()
     max_edges_viz = int(_ignored.get("max_edges_viz", 1500) or 1500)
 
-    base_node_sizes = np.full(len(nodes), float(node_size), dtype=float)
+    node_base_size = float(_ignored.get("node_size", 5) or 5)
 
     def _node_traces(frame_idx: int) -> List[go.Scatter3d]:
-        """Build separate traces for hot/cold nodes to control opacity."""
+        """Build node core + glow traces for a "fire" effect."""
         fr = node_frames[frame_idx]
+        # Получаем массив энергий
         energies = np.array([float(fr.get(n, 0.0)) for n in nodes], dtype=float)
-        # В реальных данных/симуляции иногда прилетают nan/inf; Plotly от этого "прячет" точки.
         energies = np.nan_to_num(energies, nan=0.0, posinf=0.0, neginf=0.0)
 
-        # Clip peaks ("срез пиков").
-        if vis_clip > 0.0 and energies.size:
-            q_clip = float(np.quantile(energies, float(max(0.0, min(0.999, 1.0 - vis_clip)))))
-            if np.isfinite(q_clip) and q_clip > 0:
-                energies = np.minimum(energies, q_clip)
+        # Нормализация 0..1 для цвета
+        intensities = np.clip(energies / Emax, 0.0, 1.0)
 
-        # Hotspot threshold should be computed on finite energies only.
-        finite_e = energies[np.isfinite(energies)]
-        q = float(np.quantile(finite_e, float(hotspot_q))) if finite_e.size else 0.0
-        is_hot = energies >= q
+        # Гамма-коррекция для визуализации (чтобы средние значения были виднее)
+        # vis_gamma = _ignored.get("vis_contrast", 1.0)
+        # intensities = np.power(intensities, 1.0 / vis_gamma)
 
-        c = energies / float(Emax)
-        c = np.nan_to_num(c, nan=0.0, posinf=0.0, neginf=0.0)
-        c = np.clip(c, 0.0, 1.0)
-        # Gamma/contrast.
-        if vis_gamma and vis_gamma != 1.0:
-            g = float(max(1e-6, vis_gamma))
-            c = np.power(c, 1.0 / g)
-        cold_idx = np.where(~is_hot)[0]
-        hot_idx = np.where(is_hot)[0]
+        # Динамический размер: чем больше энергии, тем жирнее узел
+        # size = base + base * intensity * multiplier
+        sizes = node_base_size * (1.0 + intensities * 2.5)
+
         traces: List[go.Scatter3d] = []
-        if cold_idx.size:
+
+        # 1. Основной слой (Core): Яркий, непрозрачный
+        traces.append(
+            go.Scatter3d(
+                x=xs,
+                y=ys,
+                z=zs,
+                mode="markers",
+                marker=dict(
+                    size=sizes,
+                    color=intensities,
+                    # Blackbody - это от черного к красному, желтому и белому.
+                    # Идеально для эффекта "накаливания".
+                    colorscale="Blackbody",
+                    cmin=0.0,
+                    cmax=1.0,
+                    opacity=1.0,
+                ),
+                text=[f"{n}: {e:.2f}" for n, e in zip(nodes, energies)],
+                hoverinfo="text",
+                name="nodes_core",
+            )
+        )
+
+        # 2. Слой свечения (Glow / Halo): Только для активных узлов
+        # Берем узлы, где энергия > 5% от макс, чтобы не рисовать гало для мусора
+        mask_glow = intensities > 0.05
+        if np.any(mask_glow):
             traces.append(
                 go.Scatter3d(
-                    x=[xs[i] for i in cold_idx.tolist()],
-                    y=[ys[i] for i in cold_idx.tolist()],
-                    z=[zs[i] for i in cold_idx.tolist()],
+                    x=xs[mask_glow],
+                    y=ys[mask_glow],
+                    z=zs[mask_glow],
                     mode="markers",
                     marker=dict(
-                        size=base_node_sizes[cold_idx].astype(float).tolist(),
-                        color=c[cold_idx].astype(float).tolist(),
-                        colorscale="Viridis",
-                        opacity=float(base_node_opacity),
+                        # Гало в 2 раза больше ядра
+                        size=sizes[mask_glow] * 2.2,
+                        color=intensities[mask_glow],
+                        colorscale="Blackbody",
+                        cmin=0.0,
+                        cmax=1.0,
+                        # Полупрозрачное
+                        opacity=0.3,
                     ),
-                    text=[str(nodes[i]) for i in cold_idx],
-                    hoverinfo="text",
-                    name="nodes",
+                    hoverinfo="skip",
+                    name="nodes_glow",
                 )
             )
-        if hot_idx.size:
-            traces.append(
-                go.Scatter3d(
-                    x=[xs[i] for i in hot_idx.tolist()],
-                    y=[ys[i] for i in hot_idx.tolist()],
-                    z=[zs[i] for i in hot_idx.tolist()],
-                    mode="markers",
-                    marker=dict(
-                        size=(base_node_sizes[hot_idx] * float(hotspot_size_mult)).astype(float).tolist(),
-                        color=c[hot_idx].astype(float).tolist(),
-                        colorscale="Viridis",
-                        opacity=1.0,
-                    ),
-                    text=[str(nodes[i]) for i in hot_idx],
-                    hoverinfo="text",
-                    name="nodes_hot",
-                )
-            )
+
         return traces
 
     def _edges_traces(frame_idx: int) -> List[go.Scatter3d]:

@@ -28,7 +28,8 @@ def render(G_view: nx.Graph | None, active_entry: GraphEntry, seed_val: int, src
         show_labels = st.checkbox("Показать ID узлов", False)
         node_size = st.slider("Размер узлов", 1, 20, 4)
         max_nodes_viz = st.slider("Макс. узлов (виз)", 500, 20000, 6000, step=500)
-        max_edges_viz = st.slider("Макс. рёбер (виз)", 500, 80000, 20000, step=500)
+        # 20k edges перегружают браузер; 2.5k держат FPS комфортным.
+        max_edges_viz = st.slider("Макс. рёбер (виз)", 500, 10000, 2500, step=500)
         layout_mode = st.selectbox("Layout", ["Fixed (по исходному графу)", "Recompute (по текущему виду)"], index=0)
 
         st.info("3D-визуализация: фиксированный layout лучше для сравнения по шагам (не прыгает).")
